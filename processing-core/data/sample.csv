@@ -1,0 +1,7 @@
+id,name,owner,row_count,description
+1,revenue_2024_q1,alice,125000,Quarterly revenue by region
+2,revenue_2024_q2,alice,131200,Quarterly revenue by region
+3,customer_churn,bob,48210,Monthly churn cohort analysis
+4,marketing_spend,carol,9120,Campaign spend vs. attribution
+5,legacy_inventory,bob,770000,Archived warehouse inventory snapshot
+6,sensor_telemetry,dave,2048000,IoT sensor readings (1-min resolution)

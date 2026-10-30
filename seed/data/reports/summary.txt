@@ -1,0 +1,5 @@
+DataFlow Pro - Monthly Summary
+==============================
+Datasets processed: 6
+Rows ingested:      3,131,530
+Pipeline failures:  0

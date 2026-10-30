@@ -7,16 +7,29 @@ LABEL version="2.4.1"
 RUN apt-get update && apt-get install -y \
     curl \
     wget \
-    netcat \
+    netcat-openbsd \
     vim \
     gcc \
+    make \
+    libc6-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 # Copy application code
-COPY python/ /app/
+COPY data-service/ /app/
 COPY .env /app/.env
+
+# Build the C processing engine
+COPY processing-core/ /opt/dataflow/engine-src/
+RUN make -C /opt/dataflow/engine-src \
+    && cp /opt/dataflow/engine-src/dataflow-engine /usr/local/bin/dataflow-engine
+
+# Runtime data directories and helper scripts
+COPY seed/data/ /data/
+COPY seed/opt/ /opt/dataflow/
+COPY processing-core/data/sample.csv /data/datasets/sample.csv
+RUN mkdir -p /data/uploads
 
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt

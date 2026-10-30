@@ -1,0 +1,83 @@
+name: dataflow-pro
+
+# Ports are bound to 127.0.0.1 on purpose. Change the bind address only on an
+# isolated network.
+
+services:
+  mysql:
+    image: mysql:8.0
+    command: ["--default-authentication-plugin=mysql_native_password"]
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpw
+      MYSQL_DATABASE: analytics
+    volumes:
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "127.0.0.1:3306:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-prootpw"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    networks:
+      backend:
+        aliases:
+          - db.internal.dataflow.io
+
+  metadata-mock:
+    build: ./metadata-mock
+    networks:
+      backend:
+        aliases:
+          - metadata.internal
+          - metrics.internal.dataflow.io
+
+  data-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "127.0.0.1:5000:5000"
+    networks:
+      - backend
+
+  analytics-engine:
+    build: ./analytics-engine
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: on-failure
+    ports:
+      - "127.0.0.1:8080:8080"
+    networks:
+      - backend
+
+  api-gateway:
+    build: ./api-gateway
+    depends_on:
+      mysql:
+        condition: service_healthy
+      data-service:
+        condition: service_started
+      analytics-engine:
+        condition: service_started
+    environment:
+      DATA_SERVICE_URL: http://data-service:5000
+      ANALYTICS_URL: http://analytics-engine:8080
+    ports:
+      - "127.0.0.1:8443:8443"
+    networks:
+      - backend
+
+  frontend-dashboard:
+    build: ./frontend-dashboard
+    environment:
+      API_BASE: https://localhost:8443/api/v1
+    ports:
+      - "127.0.0.1:3000:3000"
+    networks:
+      - backend
+
+networks:
+  backend:
+    driver: bridge

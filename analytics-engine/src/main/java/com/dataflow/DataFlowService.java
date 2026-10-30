@@ -47,7 +47,22 @@ public class DataFlowService {
         props.setProperty("user", DB_USER);
         props.setProperty("password", DB_PASS);
         props.setProperty("useSSL", "false");
-        this.dbConnection = DriverManager.getConnection(DB_URL, props);
+        props.setProperty("allowPublicKeyRetrieval", "true");
+
+        Connection conn = null;
+        for (int i = 0; i < 15; i++) {
+            try {
+                conn = DriverManager.getConnection(DB_URL, props);
+                break;
+            } catch (SQLException e) {
+                logger.warn("Waiting for database connection ({}/15): {}", i + 1, e.getMessage());
+                Thread.sleep(2000);
+            }
+        }
+        if (conn == null) {
+            throw new SQLException("Could not connect to database after retries");
+        }
+        this.dbConnection = conn;
         logger.info("DataFlowService initialised – connected to analytics database");
     }
 
@@ -305,6 +320,92 @@ public class DataFlowService {
             }
         });
 
+        server.createContext("/api/v1/users/lookup", exchange -> {
+            String username = getQueryParam(exchange, "username");
+            try {
+                String result = lookupUser(username);
+                if (result != null) {
+                    sendResponse(exchange, 200, result);
+                } else {
+                    sendResponse(exchange, 404, "{\"error\":\"user not found\"}");
+                }
+            } catch (SQLException e) {
+                logger.error("User lookup failed", e);
+                sendResponse(exchange, 500, "{\"error\":\"" + e.getMessage() + "\"}");
+            }
+        });
+
+        server.createContext("/api/v1/reports/encrypt", exchange -> {
+            String body = readBody(exchange);
+            try {
+                byte[] enc = encryptReport(body);
+                sendResponse(exchange, 200,
+                    "{\"status\":\"encrypted\",\"data\":\"" + Base64.getEncoder().encodeToString(enc) + "\"}");
+            } catch (Exception e) {
+                logger.error("Encryption failed", e);
+                sendResponse(exchange, 500, "{\"error\":\"" + e.getMessage() + "\"}");
+            }
+        });
+
+        server.createContext("/api/v1/reports/encrypt-secure", exchange -> {
+            String body = readBody(exchange);
+            try {
+                byte[] key = ENCRYPTION_KEY.getBytes(StandardCharsets.UTF_8);
+                byte[] key32 = new byte[32];
+                System.arraycopy(key, 0, key32, 0, Math.min(key.length, 32));
+                byte[] enc = encryptReportSecure(body, key32);
+                sendResponse(exchange, 200,
+                    "{\"status\":\"encrypted\",\"data\":\"" + Base64.getEncoder().encodeToString(enc) + "\"}");
+            } catch (Exception e) {
+                logger.error("Secure encryption failed", e);
+                sendResponse(exchange, 500, "{\"error\":\"" + e.getMessage() + "\"}");
+            }
+        });
+
+        server.createContext("/api/v1/datasets/description", exchange -> {
+            String idStr = getQueryParam(exchange, "id");
+            String desc = getQueryParam(exchange, "description");
+            if (desc.isEmpty()) {
+                desc = readBody(exchange);
+            }
+            try {
+                int id = Integer.parseInt(idStr);
+                boolean ok = updateDatasetDescription(id, desc);
+                sendResponse(exchange, 200, "{\"updated\":" + ok + "}");
+            } catch (Exception e) {
+                logger.error("Update dataset failed", e);
+                sendResponse(exchange, 500, "{\"error\":\"" + e.getMessage() + "\"}");
+            }
+        });
+
+        server.createContext("/api/v1/xml/config", exchange -> {
+            String body = readBody(exchange);
+            try {
+                Document doc = parseConfigSecurely(body);
+                sendResponse(exchange, 200,
+                    "{\"status\":\"parsed\",\"root\":\"" + doc.getDocumentElement().getTagName() + "\"}");
+            } catch (Exception e) {
+                logger.error("XML config parse failed", e);
+                sendResponse(exchange, 400, "{\"error\":\"" + e.getMessage() + "\"}");
+            }
+        });
+
+        server.createContext("/api/v1/reports/file", exchange -> {
+            String name = getQueryParam(exchange, "name");
+            try {
+                byte[] data = getReportFile(name);
+                exchange.getResponseHeaders().set("Content-Type", "text/plain");
+                exchange.sendResponseHeaders(200, data.length);
+                exchange.getResponseBody().write(data);
+                exchange.getResponseBody().close();
+            } catch (FileNotFoundException e) {
+                sendResponse(exchange, 404, "{\"error\":\"not found\"}");
+            } catch (Exception e) {
+                logger.error("Get report failed", e);
+                sendResponse(exchange, 403, "{\"error\":\"" + e.getMessage() + "\"}");
+            }
+        });
+
         server.setExecutor(null);
         server.start();
         logger.info("DataFlow Java service started on port {}", port);
@@ -314,11 +415,17 @@ public class DataFlowService {
     // Utility methods
     // -----------------------------------------------------------------------
     private String getQueryParam(HttpExchange exchange, String key) {
-        String query = exchange.getRequestURI().getQuery();
+        String query = exchange.getRequestURI().getRawQuery();
         if (query == null) return "";
         for (String param : query.split("&")) {
             String[] kv = param.split("=", 2);
-            if (kv[0].equals(key) && kv.length == 2) return kv[1];
+            if (kv[0].equals(key) && kv.length == 2) {
+                try {
+                    return java.net.URLDecoder.decode(kv[1], StandardCharsets.UTF_8.name());
+                } catch (Exception e) {
+                    return kv[1];
+                }
+            }
         }
         return "";
     }

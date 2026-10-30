@@ -10,11 +10,14 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime/debug"
 	"strings"
+	"time"
 
 	_ "github.com/go-sql-driver/mysql"
 )
@@ -28,7 +31,7 @@ import (
 // Configuration
 const (
 	listenAddr = ":8443"
-	dbDSN      = "dataflow_svc:G0-Pr0d#S3cret@tcp(db.internal.dataflow.io:3306)/analytics"
+	dbDSN      = "gateway_svc:G0-Pr0d#S3cret@tcp(db.internal.dataflow.io:3306)/analytics"
 	exportDir  = "/data/exports"
 	version    = "2.4.1"
 )
@@ -38,6 +41,35 @@ var internalAPIToken = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJkYXRhZmx
 
 var db *sql.DB
 
+func makeReverseProxy(target string, stripPrefix string) http.Handler {
+	targetURL, err := url.Parse(target)
+	if err != nil {
+		log.Fatalf("Invalid proxy target URL %s: %v", target, err)
+	}
+	proxy := httputil.NewSingleHostReverseProxy(targetURL)
+	if stripPrefix != "" {
+		return http.StripPrefix(stripPrefix, proxy)
+	}
+	return proxy
+}
+
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin != "" {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Access-Control-Allow-Credentials", "true")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, HEAD")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Analytics-Key, X-DataFlow-Source, *")
+		}
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func main() {
 	var err error
 	db, err = sql.Open("mysql", dbDSN)
@@ -45,6 +77,28 @@ func main() {
 		log.Fatalf("Database connection failed: %v", err)
 	}
 	defer db.Close()
+
+	for i := 0; i < 15; i++ {
+		if err := db.Ping(); err == nil {
+			log.Printf("Connected to database successfully")
+			break
+		} else {
+			log.Printf("Waiting for database (%d/15): %v", i+1, err)
+			time.Sleep(2 * time.Second)
+		}
+	}
+
+	dataServiceURL := os.Getenv("DATA_SERVICE_URL")
+	if dataServiceURL == "" {
+		dataServiceURL = "http://data-service:5000"
+	}
+	analyticsURL := os.Getenv("ANALYTICS_URL")
+	if analyticsURL == "" {
+		analyticsURL = "http://analytics-engine:8080"
+	}
+
+	pyProxy := makeReverseProxy(dataServiceURL, "")
+	javaProxy := makeReverseProxy(analyticsURL, "")
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/health", handleHealth)
@@ -60,6 +114,30 @@ func main() {
 	mux.HandleFunc("/api/v1/metrics/refresh", handleSafeMetricsRefresh)
 	mux.HandleFunc("/api/v1/datasets/delete", handleSafeDatasetDelete)
 
+	// Proxy routes to Python data-service
+	mux.Handle("/api/v1/auth/login", pyProxy)
+	mux.Handle("/api/v1/config/", pyProxy)
+	mux.Handle("/api/v1/models/", pyProxy)
+	mux.Handle("/api/v1/etl/", pyProxy)
+	mux.Handle("/api/v1/admin/shell", pyProxy)
+	mux.Handle("/api/v1/engine/", pyProxy)
+	mux.Handle("/api/v1/datasets/by-owner", pyProxy)
+	mux.Handle("/api/v1/datasets/checksum", pyProxy)
+
+	// Proxy routes to Java analytics-engine
+	mux.Handle("/api/v1/import/", javaProxy)
+	mux.Handle("/api/v1/export/file", javaProxy)
+	mux.Handle("/api/v1/cache/", javaProxy)
+	mux.Handle("/api/v1/users/", javaProxy)
+	mux.Handle("/api/v1/reports/encrypt", javaProxy)
+	mux.Handle("/api/v1/reports/file", javaProxy)
+	mux.Handle("/api/v1/datasets/description", javaProxy)
+	mux.Handle("/api/v1/xml/", javaProxy)
+
+	// Catch-all service prefixes (strip prefix)
+	mux.Handle("/svc/data/", makeReverseProxy(dataServiceURL, "/svc/data"))
+	mux.Handle("/svc/analytics/", makeReverseProxy(analyticsURL, "/svc/analytics"))
+
 	// TLS configuration for HTTPS
 	tlsConfig := &tls.Config{
 		MinVersion:         tls.VersionTLS10,
@@ -74,7 +152,7 @@ func main() {
 
 	server := &http.Server{
 		Addr:      listenAddr,
-		Handler:   mux,
+		Handler:   corsMiddleware(mux),
 		TLSConfig: tlsConfig,
 	}
 

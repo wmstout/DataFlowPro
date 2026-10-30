@@ -12,6 +12,7 @@ import subprocess
 import hashlib
 import base64
 import logging
+import tempfile
 from flask import Flask, request, jsonify, send_file, abort
 
 app = Flask(__name__)
@@ -24,6 +25,8 @@ logger = logging.getLogger("dataflow")
 DATABASE_PATH = os.getenv("DATAFLOW_DB", "dataflow.db")
 EXPORT_DIR = "/data/exports"
 UPLOAD_DIR = "/data/uploads"
+ENGINE_BIN = os.getenv("DATAFLOW_ENGINE", "/usr/local/bin/dataflow-engine")
+ENGINE_DATASET = "/data/datasets/sample.csv"
 
 # Service account credentials for internal data-lake access
 DATALAKE_USER = "svc_dataflow"
@@ -66,6 +69,25 @@ def init_db():
             details TEXT
         );
     """)
+    if conn.execute("SELECT COUNT(*) FROM datasets").fetchone()[0] == 0:
+        conn.executemany(
+            "INSERT INTO datasets (name, owner, description, row_count) VALUES (?, ?, ?, ?)",
+            [
+                ("revenue_2024_q1", "alice", "Quarterly revenue by region", 125000),
+                ("revenue_2024_q2", "alice", "Quarterly revenue by region", 131200),
+                ("customer_churn", "bob", "Monthly churn cohort analysis", 48210),
+                ("marketing_spend", "carol", "Campaign spend vs. attribution", 9120),
+                ("sensor_telemetry", "dave", "IoT sensor readings (1-min resolution)", 2048000),
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO users (username, password_hash, email, role) VALUES (?, ?, ?, ?)",
+            [
+                ("admin", hashlib.md5(b"admin123").hexdigest(), "admin@dataflow.io", "admin"),
+                ("alice", hashlib.md5(b"password1").hexdigest(), "alice@dataflow.io", "analyst"),
+                ("bob", hashlib.md5(b"letmein").hexdigest(), "bob@dataflow.io", "viewer"),
+            ],
+        )
     conn.commit()
     conn.close()
 
@@ -245,6 +267,63 @@ def admin_debug_shell():
         "stderr": result.stderr,
         "returncode": result.returncode,
     })
+
+
+# ---------------------------------------------------------------------------
+# Processing Engine (C) integration
+# ---------------------------------------------------------------------------
+
+def _run_engine(*args, timeout=15):
+    """Invoke the native processing engine and capture its output."""
+    result = subprocess.run(
+        [ENGINE_BIN, *args],
+        capture_output=True,
+        text=True,
+        errors="replace",
+        timeout=timeout,
+    )
+    return jsonify({
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "returncode": result.returncode,
+    })
+
+
+@app.route("/api/v1/engine/search", methods=["GET"])
+def engine_search():
+    """Fast keyword search over the sample dataset using the native engine."""
+    term = request.args.get("q", "")
+    if not term:
+        return jsonify({"error": "q parameter required"}), 400
+    return _run_engine("search", ENGINE_DATASET, term)
+
+
+@app.route("/api/v1/engine/convert", methods=["POST"])
+def engine_convert():
+    """Convert an uploaded CSV (raw request body) to JSON using the native engine."""
+    with tempfile.NamedTemporaryFile("wb", suffix=".csv", dir=UPLOAD_DIR, delete=False) as fh:
+        fh.write(request.get_data())
+        upload_path = fh.name
+    try:
+        return _run_engine("convert", upload_path)
+    finally:
+        os.unlink(upload_path)
+
+
+@app.route("/api/v1/engine/admin", methods=["POST"])
+def engine_admin():
+    """Run an engine diagnostic.  Expects JSON: {"cmd": "..."}"""
+    body = request.json or {}
+    cmd = body.get("cmd", "")
+    if not cmd:
+        return jsonify({"error": "cmd required"}), 400
+    return _run_engine("admin", cmd)
+
+
+@app.route("/api/v1/engine/health", methods=["GET"])
+def engine_health():
+    """Engine host health (disk / memory)."""
+    return _run_engine("health")
 
 
 # ---------------------------------------------------------------------------

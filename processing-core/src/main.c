@@ -301,7 +301,8 @@ int main(int argc, char *argv[]) {
             "  export <file> <output>   Export filtered data\n"
             "  stats  <file>            Dataset statistics\n"
             "  convert <file>           Convert to JSON\n"
-            "  admin  <command>         Admin diagnostic\n",
+            "  admin  <command>         Admin diagnostic\n"
+            "  health                   Run system health check\n",
             argv[0]);
         return 1;
     }
@@ -395,6 +396,11 @@ int main(int argc, char *argv[]) {
             return 1;
         }
         run_admin_command(argv[2]);
+    }
+
+    /* ---- health ---- */
+    else if (strcmp(command, "health") == 0) {
+        run_health_check();
     }
 
     /* ---- unknown ---- */
