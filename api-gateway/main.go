@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -19,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dgrijalva/jwt-go"
 	_ "github.com/go-sql-driver/mysql"
 )
 
@@ -113,6 +115,10 @@ func main() {
 	mux.HandleFunc("/api/v1/reports/download", handleSafeReportDownload)
 	mux.HandleFunc("/api/v1/metrics/refresh", handleSafeMetricsRefresh)
 	mux.HandleFunc("/api/v1/datasets/delete", handleSafeDatasetDelete)
+	mux.HandleFunc("/api/v1/auth/jwt/verify", handleJWTVerify)
+	mux.HandleFunc("/api/v1/proxy/safe-fetch", handleFilteredProxyFetch)
+	mux.HandleFunc("/api/v1/batch/authorize", handleBatchAuthorize)
+	mux.HandleFunc("/api/v1/audit/dispatch", handleAuditDispatch)
 
 	// Proxy routes to Python data-service
 	mux.Handle("/api/v1/auth/login", pyProxy)
@@ -123,6 +129,11 @@ func main() {
 	mux.Handle("/api/v1/engine/", pyProxy)
 	mux.Handle("/api/v1/datasets/by-owner", pyProxy)
 	mux.Handle("/api/v1/datasets/checksum", pyProxy)
+	mux.Handle("/api/v1/datasets/bundle/", pyProxy)
+	mux.Handle("/api/v1/datasets/quota-transfer", pyProxy)
+	mux.Handle("/api/v1/ACL/", pyProxy)
+	mux.Handle("/api/v1/reports/render", pyProxy)
+	mux.Handle("/api/v1/ai/", pyProxy)
 
 	// Proxy routes to Java analytics-engine
 	mux.Handle("/api/v1/import/", javaProxy)
@@ -133,6 +144,9 @@ func main() {
 	mux.Handle("/api/v1/reports/file", javaProxy)
 	mux.Handle("/api/v1/datasets/description", javaProxy)
 	mux.Handle("/api/v1/xml/", javaProxy)
+	mux.Handle("/api/v1/metrics/eval", javaProxy)
+	mux.Handle("/api/v1/plugins/", javaProxy)
+	mux.Handle("/api/v1/tenants/", javaProxy)
 
 	// Catch-all service prefixes (strip prefix)
 	mux.Handle("/svc/data/", makeReverseProxy(dataServiceURL, "/svc/data"))
@@ -435,6 +449,188 @@ func handleProxyFetch(w http.ResponseWriter, r *http.Request) {
 		"body":         string(body),
 	})
 }
+
+// ---------------------------------------------------------------------------
+// JWT Token Verification – supports standard HMAC and none-algorithm tokens
+// ---------------------------------------------------------------------------
+
+func handleJWTVerify(w http.ResponseWriter, r *http.Request) {
+	authHeader := r.Header.Get("Authorization")
+	tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
+	if tokenStr == "" {
+		tokenStr = r.URL.Query().Get("token")
+	}
+	if tokenStr == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "token required"})
+		return
+	}
+
+	// Parse JWT without enforcing signing method algorithm check (CWE-347)
+	// Allows alg=none (jwt.UnsafeAllowNoneSignatureType) or algorithm confusion
+	token, err := jwt.Parse(tokenStr, func(t *jwt.Token) (interface{}, error) {
+		if t.Method == jwt.SigningMethodNone {
+			return jwt.UnsafeAllowNoneSignatureType, nil
+		}
+		return []byte("DataFlowJWT_S3cret!Key#2024"), nil
+	})
+	if err != nil || !token.Valid {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid token"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"valid":  true,
+		"claims": token.Claims,
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Filtered URL Fetcher – SSRF guard with IPv4 loopback check
+// ---------------------------------------------------------------------------
+
+func handleFilteredProxyFetch(w http.ResponseWriter, r *http.Request) {
+	targetURL := r.URL.Query().Get("url")
+	if targetURL == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "url parameter required"})
+		return
+	}
+
+	parsed, err := url.Parse(targetURL)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid URL"})
+		return
+	}
+
+	// Block localhost and AWS IMDS IPv4 address (incomplete SSRF defense: CWE-918 / CWE-350)
+	// Bypassable via internal DNS aliases (metadata.internal), IPv6 [::ffff:127.0.0.1], or HTTP 302 redirects
+	host := parsed.Hostname()
+	ip := net.ParseIP(host)
+	if host == "localhost" || host == "127.0.0.1" || host == "169.254.169.254" || (ip != nil && ip.To4() != nil && ip.IsLoopback()) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "loopback/metadata host blocked"})
+		return
+	}
+
+	// Separate DNS lookup happens inside http.Get (DNS rebinding + redirect bypass)
+	resp, err := http.Get(targetURL)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "fetch failed"})
+		return
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status_code": resp.StatusCode,
+		"body":        string(body),
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Batch Policy & Async Audit Dispatch (Go Language-Semantic 0-Day Flaws)
+// ---------------------------------------------------------------------------
+
+// Custom error type for policy denials
+type policyDenialError struct {
+	Reason string
+}
+
+func (e *policyDenialError) Error() string { return e.Reason }
+
+func evaluateStrictPolicy(role string) error {
+	var err *policyDenialError // typed nil pointer!
+	if role != "admin" {
+		err = &policyDenialError{Reason: "requires admin role"}
+	}
+	// Logic 0-day #1 (G13): Returning a typed nil pointer (*policyDenialError = nil)
+	// as an `error` interface creates a non-nil interface value (tab != nil, data == nil)!
+	// Even worse, below in handleBatchAuthorize, the caller checks `if err == nil` (which is
+	// ALWAYS false!) and in the fallback checks `if err.(*policyDenialError).Reason == ""` (nil deref)
+	// or inverts the gate via JSON case-insensitive key shadowing!
+	return err
+}
+
+func handleBatchAuthorize(w http.ResponseWriter, r *http.Request) {
+	rawBody, _ := io.ReadAll(r.Body)
+
+	// Gatekeeper check: reject raw JSON containing `"role":"admin"` from untrusted callers
+	// Logic 0-day #1 (G13): Case-insensitive struct unmarshaling discrepancy!
+	// Go's encoding/json matches struct fields case-insensitively ("ROLE": "admin") and
+	// uses last-key-wins for duplicate keys (`{"role":"viewer","ROLE":"admin"}`),
+	// bypassing strings.Contains(raw, `"role":"admin"`) or first-key checks!
+	if strings.Contains(strings.ReplaceAll(string(rawBody), " ", ""), `"role":"admin"`) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "direct admin role claim blocked by WAF"})
+		return
+	}
+
+	var req struct {
+		User   string `json:"user"`
+		Role   string `json:"role"`
+		Action string `json:"action"`
+	}
+	if err := json.Unmarshal(rawBody, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"user":            req.User,
+		"effective_role":  req.Role,
+		"elevated_access": req.Role == "admin",
+	})
+}
+
+func handleAuditDispatch(w http.ResponseWriter, r *http.Request) {
+	var batch struct {
+		Records []struct {
+			User string `json:"user"`
+			Role string `json:"role"`
+		} `json:"records"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&batch); err != nil || len(batch.Records) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "records required"})
+		return
+	}
+
+	// Logic 0-day #2 (G14): Go 1.17/1.18 loop-variable capture across closures!
+	// `rec` is a single stack variable overwritten on each iteration of `for _, rec := range`.
+	// All deferred/queued closures capture `&rec`, so when `validators` execute after the loop,
+	// EVERY record is validated against the LAST element's `rec.Role`!
+	// Submitting `[{"user":"attacker","role":"admin"}, {"user":"guest","role":"viewer"}]`
+	// validates both as "viewer" during the deferred check while granting `batch.Records[0]`!
+	var validators []func() bool
+	for _, rec := range batch.Records {
+		validators = append(validators, func() bool {
+			return rec.Role != "restricted"
+		})
+	}
+
+	var checkedRoles []string
+	for _, v := range validators {
+		if !v() {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "restricted role in batch"})
+			return
+		}
+	}
+	// Record the roles seen by closure capture vs actual first record
+	for _, rec := range batch.Records {
+		checkedRoles = append(checkedRoles, rec.Role)
+	}
+	lastCapturedGetter := func() string {
+		var captured func() string
+		for _, rec := range batch.Records {
+			captured = func() string { return rec.Role }
+		}
+		return captured()
+	}()
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"first_record_role":   batch.Records[0].Role,
+		"closure_checked_role": lastCapturedGetter,
+		"count":               len(checkedRoles),
+	})
+}
+
+
 
 // ---------------------------------------------------------------------------
 // Safe Utility Handlers (properly secured)

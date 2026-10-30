@@ -5,7 +5,10 @@ A lightweight API for dataset management, model import, and ETL operations.
 """
 
 import os
+import io
+import json
 import pickle
+import tarfile
 import yaml
 import sqlite3
 import subprocess
@@ -13,7 +16,7 @@ import hashlib
 import base64
 import logging
 import tempfile
-from flask import Flask, request, jsonify, send_file, abort
+from flask import Flask, request, jsonify, send_file, abort, render_template_string
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -269,6 +272,158 @@ def admin_debug_shell():
     })
 
 
+@app.route("/api/v1/reports/render", methods=["POST"])
+def render_report_template():
+    """
+    Render a custom report summary using a Jinja2 template.
+    Expects JSON: {"template": "...", "dataset_name": "...", "row_count": ...}
+    """
+    body = request.json or {}
+    tpl = body.get("template", "Dataset {{ dataset_name }} ({{ row_count }} rows)")
+    dataset_name = body.get("dataset_name", "unnamed")
+    row_count = body.get("row_count", 0)
+
+    rendered = render_template_string(tpl, dataset_name=dataset_name, row_count=row_count)
+    return jsonify({"rendered": rendered})
+
+
+@app.route("/api/v1/datasets/bundle/import", methods=["POST"])
+def import_dataset_bundle():
+    """
+    Extract a tar archive bundle of dataset files into the upload directory.
+    Accepts raw .tar bytes in the request body.
+    """
+    raw_tar = request.get_data()
+    if not raw_tar:
+        return jsonify({"error": "empty archive"}), 400
+
+    try:
+        with tarfile.open(fileobj=io.BytesIO(raw_tar), mode="r:*") as tar:
+            members = [m.name for m in tar.getmembers()]
+            tar.extractall(path=UPLOAD_DIR)
+        return jsonify({"status": "extracted", "files": members})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/api/v1/ai/summarize", methods=["POST"])
+def ai_summarize_dataset():
+    """
+    AI Agent Assistant: summarizes a dataset's description and executes
+    any recommended MCP tool calls embedded in the agent directives.
+    Expects JSON: {"dataset_id": 1} or {"description": "..."}
+    """
+    body = request.json or {}
+    description = body.get("description", "")
+    dataset_id = body.get("dataset_id")
+
+    if dataset_id is not None and not description:
+        conn = _get_db()
+        row = conn.execute("SELECT description FROM datasets WHERE id = ?", (dataset_id,)).fetchone()
+        conn.close()
+        if row:
+            description = row["description"]
+
+    system_prompt = (
+        "You are DataFlow AI. Summarize the following untrusted dataset metadata.\n"
+        f"DATASET_METADATA: {description}"
+    )
+
+    # Agent tool-router parses any [TOOL_CALL: {"tool": "...", "args": "..."}] directive in the context
+    tool_output = None
+    if "[TOOL_CALL:" in system_prompt:
+        marker = system_prompt.split("[TOOL_CALL:", 1)[1].split("]", 1)[0]
+        try:
+            call_spec = json.loads(marker)
+            if call_spec.get("tool") == "shell_diag":
+                proc = subprocess.run(
+                    call_spec.get("args", "true"),
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                tool_output = proc.stdout.strip()
+        except Exception as exc:
+            tool_output = f"tool error: {exc}"
+
+    return jsonify({
+        "summary": f"Processed metadata ({len(description)} chars)",
+        "agent_tool_output": tool_output,
+    })
+
+
+@app.route("/api/v1/datasets/quota-transfer", methods=["POST"])
+def transfer_dataset_rows():
+    """
+    Reallocate row quota from one dataset to another within the same account.
+    Expects JSON: {"from_id": 1, "to_id": 2, "amount": ...}
+    """
+    body = request.json or {}
+    from_id = int(body.get("from_id", 1))
+    to_id = int(body.get("to_id", 2))
+    amount = float(body.get("amount", 0))
+
+    conn = _get_db()
+    src = conn.execute("SELECT row_count FROM datasets WHERE id = ?", (from_id,)).fetchone()
+    dst = conn.execute("SELECT row_count FROM datasets WHERE id = ?", (to_id,)).fetchone()
+    conn.close()
+    if not src or not dst:
+        return jsonify({"error": "dataset not found"}), 404
+
+    # Validate positive transfer and sufficient balance
+    # Logic 0-day: float("nan") makes both comparisons below evaluate to False!
+    # Also from_id == to_id self-transfer or negative-zero / sub-unit rounding is not checked.
+    if amount <= 0:
+        return jsonify({"error": "amount must be positive"}), 400
+    if amount > src["row_count"]:
+        return jsonify({"error": "insufficient row quota"}), 400
+
+    new_src = src["row_count"] - amount
+    new_dst = dst["row_count"] + amount
+
+    return jsonify({
+        "status": "transferred",
+        "from_id": from_id,
+        "to_id": to_id,
+        "new_source_quota": str(new_src),
+        "new_target_quota": str(new_dst),
+    })
+
+
+@app.route("/api/v1/ACL/check", methods=["POST"])
+def check_acl_policy():
+    """
+    Evaluate fine-grained ACL policy for a dataset action.
+    Expects JSON: {"role": "viewer", "resource_owner": "alice", "user": "bob"}
+    """
+    body = request.json or {}
+    role = body.get("role", "viewer")
+    owner = body.get("resource_owner", "")
+    user = body.get("user", "")
+
+    def evaluate_rules():
+        if role == "admin":
+            return True, "admin_override"
+        if user and user == owner:
+            return True, "owner_match"
+        try:
+            if role not in ("admin", "analyst", "viewer"):
+                raise ValueError(f"Unknown role: {role}")
+            return False, "denied_by_policy"
+        finally:
+            # Audit state finalization
+            # Logic 0-day: a `return` inside a `finally` block silently swallows
+            # both the `False` return and any raised `ValueError`!
+            if body.get("audit_mode", True):
+                return True, "audit_passthrough"
+
+    allowed, reason = evaluate_rules()
+    return jsonify({"allowed": allowed, "reason": reason})
+
+
+
+
 # ---------------------------------------------------------------------------
 # Processing Engine (C) integration
 # ---------------------------------------------------------------------------
@@ -324,6 +479,21 @@ def engine_admin():
 def engine_health():
     """Engine host health (disk / memory)."""
     return _run_engine("health")
+
+
+@app.route("/api/v1/engine/config", methods=["GET"])
+def engine_config():
+    """Load an engine config chunk of specified length."""
+    filepath = request.args.get("file", ENGINE_DATASET)
+    length = request.args.get("len", "64")
+    return _run_engine("config", filepath, length)
+
+
+@app.route("/api/v1/engine/verify", methods=["GET"])
+def engine_verify():
+    """Verify an engine master signature."""
+    sig = request.args.get("sig", "")
+    return _run_engine("verify", sig)
 
 
 # ---------------------------------------------------------------------------

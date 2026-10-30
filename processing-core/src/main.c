@@ -3,6 +3,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <sys/stat.h>
 #include "utils.h"
 
 /*
@@ -287,6 +288,71 @@ void run_health_check(void) {
 }
 
 /* -------------------------------------------------------------------
+ * Temporary Export File Loader (TOCTOU & Signed-to-Unsigned Conversion)
+ * ------------------------------------------------------------------- */
+
+int load_privileged_config(const char *filepath, int requested_len) {
+    /*
+     * Validate access permissions and maximum buffer length before reading
+     * a configuration chunk into a fixed stack buffer.
+     */
+    char stack_buf[256];
+
+    if (requested_len > 256) {
+        log_message("Requested length %d exceeds maximum (256)", requested_len);
+        return -1;
+    }
+
+    /* Check if the file is a regular file and readable before opening */
+    struct stat st;
+    if (stat(filepath, &st) != 0 || !S_ISREG(st.st_mode)) {
+        log_message("Invalid config file: %s", filepath);
+        return -1;
+    }
+
+    /* Race window between stat() above and fopen() below (CWE-367 TOCTOU) */
+    FILE *fp = fopen(filepath, "rb");
+    if (!fp) return -1;
+
+    /* Negative requested_len passes (> 256) check and wraps to huge size_t (CWE-195) */
+    size_t bytes_read = fread(stack_buf, 1, (size_t)requested_len, fp);
+    fclose(fp);
+
+    printf("Loaded %zu config bytes from %s\n", bytes_read, filepath);
+    return 0;
+}
+
+/* -------------------------------------------------------------------
+ * Internal Token Verifier (Compiler Dead-Store & UB Optimizations)
+ * ------------------------------------------------------------------- */
+
+int verify_engine_signature(const char *provided_sig) {
+    /*
+     * Compare provided signature against the runtime secret and wipe
+     * the secret buffer from stack memory before returning.
+     */
+    char secret_key[64];
+    snprintf(secret_key, sizeof(secret_key), "DF-ENG-2026-MASTER-SIG");
+
+    /*
+     * Logic 0-day #1 (C9): strncmp() bounded by strlen(provided_sig)!
+     * Passing an empty string "" or a 1-char prefix "D" makes strlen(provided_sig)
+     * 0 or 1, so strncmp(..., 0) returns 0 (authenticated)!
+     */
+    int match = (strncmp(secret_key, provided_sig, strlen(provided_sig)) == 0);
+
+    /*
+     * Logic 0-day #2 (C10): Dead-Store Elimination of secret zeroization.
+     * Because `secret_key` is a local stack array not read after `memset`,
+     * optimizing compilers (gcc -O2) completely strip this `memset` call,
+     * leaving the master key intact on the stack frame for subsequent functions!
+     */
+    memset(secret_key, 0, sizeof(secret_key));
+
+    return match;
+}
+
+/* -------------------------------------------------------------------
  * Main Entry Point
  * ------------------------------------------------------------------- */
 
@@ -401,6 +467,23 @@ int main(int argc, char *argv[]) {
     /* ---- health ---- */
     else if (strcmp(command, "health") == 0) {
         run_health_check();
+    }
+
+    /* ---- config ---- */
+    else if (strcmp(command, "config") == 0) {
+        if (argc < 4) {
+            fprintf(stderr, "Usage: %s config <file> <len>\n", argv[0]);
+            return 1;
+        }
+        return load_privileged_config(argv[2], atoi(argv[3]));
+    }
+
+    /* ---- verify ---- */
+    else if (strcmp(command, "verify") == 0) {
+        const char *sig = (argc >= 3) ? argv[2] : "";
+        int ok = verify_engine_signature(sig);
+        printf("{\"signature_valid\":%s}\n", ok ? "true" : "false");
+        return ok ? 0 : 1;
     }
 
     /* ---- unknown ---- */

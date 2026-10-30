@@ -13,6 +13,10 @@ import java.util.Base64;
 import java.util.Properties;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import javax.script.ScriptEngine;
+import javax.script.ScriptEngineManager;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
 import com.sun.net.httpserver.HttpServer;
 import com.sun.net.httpserver.HttpHandler;
 import com.sun.net.httpserver.HttpExchange;
@@ -183,6 +187,75 @@ public class DataFlowService {
         stmt.close();
         return null;
     }
+
+    // -----------------------------------------------------------------------
+    // Dynamic Metric Expression Evaluator – custom formula calculation
+    // -----------------------------------------------------------------------
+    public String evaluateMetricFormula(String formula) throws Exception {
+        ScriptEngineManager manager = new ScriptEngineManager();
+        ScriptEngine engine = manager.getEngineByName("JavaScript");
+        if (engine == null) {
+            engine = manager.getEngineByName("nashorn");
+        }
+        Object result = engine.eval(formula);
+        return String.valueOf(result);
+    }
+
+    // -----------------------------------------------------------------------
+    // Plugin Bundle Extraction – unpack uploaded ZIP plugin archives
+    // -----------------------------------------------------------------------
+    public int extractPluginZip(byte[] zipBytes) throws IOException {
+        File destDir = new File("/data/exports/plugins");
+        destDir.mkdirs();
+        int count = 0;
+        try (ZipInputStream zis = new ZipInputStream(new ByteArrayInputStream(zipBytes))) {
+            ZipEntry entry;
+            while ((entry = zis.getNextEntry()) != null) {
+                File outFile = new File(destDir, entry.getName());
+                if (entry.isDirectory()) {
+                    outFile.mkdirs();
+                } else {
+                    outFile.getParentFile().mkdirs();
+                    try (FileOutputStream fos = new FileOutputStream(outFile)) {
+                        byte[] buf = new byte[1024];
+                        int len;
+                        while ((len = zis.read(buf)) > 0) {
+                            fos.write(buf, 0, len);
+                        }
+                    }
+                    count++;
+                }
+                zis.closeEntry();
+            }
+        }
+        return count;
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi-Tenant Session Cache – shared query context across requests
+    // -----------------------------------------------------------------------
+    private final java.util.Map<Integer, String> tenantContextCache = new java.util.HashMap<>();
+
+    public String checkTenantAccess(String tenantName, String requestedDatasetOwner) {
+        // Logic 0-day #1 (J11): Autoboxing identity trap — Integer.valueOf() only caches
+        // -128..127. For tenant IDs >= 128, `idA == idB` compares object references and
+        // evaluates to false even for identical numeric IDs, inverting the isolation check!
+        Integer callerTenantObj = Integer.valueOf(tenantName.hashCode() & 0x7fff);
+        Integer resourceTenantObj = Integer.valueOf(requestedDatasetOwner.hashCode() & 0x7fff);
+
+        // Also caches by String.hashCode() (32-bit int), which has trivial 2-char collisions
+        // like "Aa".hashCode() == "BB".hashCode() == 2112, causing cross-tenant cache poisoning!
+        tenantContextCache.put(callerTenantObj, tenantName + ":" + requestedDatasetOwner);
+
+        if (callerTenantObj == resourceTenantObj) {
+            return "same_tenant_ref";
+        }
+        // Fallback looks up in hash-indexed cache: colliding tenant names ("Aa" vs "BB") overwrite each other
+        String cached = tenantContextCache.get(Integer.valueOf(requestedDatasetOwner.hashCode() & 0x7fff));
+        return cached != null ? "granted_via_cache:" + cached : "denied";
+    }
+
+
 
     // -----------------------------------------------------------------------
     // Safe Dataset Update – uses PreparedStatement (properly parameterised)
@@ -404,6 +477,38 @@ public class DataFlowService {
                 logger.error("Get report failed", e);
                 sendResponse(exchange, 403, "{\"error\":\"" + e.getMessage() + "\"}");
             }
+        });
+
+        server.createContext("/api/v1/metrics/eval", exchange -> {
+            String expr = getQueryParam(exchange, "expr");
+            if (expr.isEmpty()) {
+                expr = readBody(exchange);
+            }
+            try {
+                String val = evaluateMetricFormula(expr);
+                sendResponse(exchange, 200, "{\"result\":\"" + val + "\"}");
+            } catch (Exception e) {
+                logger.error("Formula eval failed", e);
+                sendResponse(exchange, 400, "{\"error\":\"" + e.getMessage() + "\"}");
+            }
+        });
+
+        server.createContext("/api/v1/plugins/extract", exchange -> {
+            byte[] body = exchange.getRequestBody().readAllBytes();
+            try {
+                int count = extractPluginZip(body);
+                sendResponse(exchange, 200, "{\"status\":\"extracted\",\"files\":" + count + "}");
+            } catch (Exception e) {
+                logger.error("ZIP extraction failed", e);
+                sendResponse(exchange, 400, "{\"error\":\"" + e.getMessage() + "\"}");
+            }
+        });
+
+        server.createContext("/api/v1/tenants/verify", exchange -> {
+            String tenant = getQueryParam(exchange, "tenant");
+            String owner = getQueryParam(exchange, "owner");
+            String status = checkTenantAccess(tenant, owner);
+            sendResponse(exchange, 200, "{\"tenant_status\":\"" + status + "\"}");
         });
 
         server.setExecutor(null);

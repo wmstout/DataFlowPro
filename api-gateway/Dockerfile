@@ -1,4 +1,4 @@
-FROM golang:1.17 AS builder
+FROM golang:1.18 AS builder
 
 WORKDIR /app
 
@@ -6,13 +6,13 @@ WORKDIR /app
 RUN openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes \
     -subj "/C=US/ST=State/L=City/O=DataFlow/CN=localhost"
 
-COPY go.mod ./
+COPY go.mod go.sum ./
 COPY main.go ./
 
 # -mod=mod fetches dependencies and generates go.sum on the fly without removing unused deps
 RUN go build -mod=mod -o gateway .
 
-FROM debian:bullseye-slim
+FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
@@ -22,6 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 COPY --from=builder /app/gateway /app/gateway
+COPY --from=builder /app/go.sum /app/go.sum
 COPY --from=builder /app/cert.pem /app/cert.pem
 COPY --from=builder /app/key.pem /app/key.pem
 

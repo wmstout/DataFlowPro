@@ -332,6 +332,65 @@ function applyUserPreferences(prefsJson) {
 })();
 
 // ---------------------------------------------------------------------------
+// Chained DOM Clobbering / Prototype Pollution Gadget + ReDoS Filter
+// ---------------------------------------------------------------------------
+
+/**
+ * Dynamically load an analytics telemetry plugin script.
+ * Chained gadget: if state.config (or Object.prototype via deepMerge / JS3) or
+ * window.DATAFLOW_TELEMETRY (via DOM Clobbering) defines pluginUrl, this
+ * injects an attacker-controlled <script src="..."> into the document.
+ */
+function loadTelemetryPlugin() {
+    const cfg = state.config || {};
+    const clobbered = window.DATAFLOW_TELEMETRY && window.DATAFLOW_TELEMETRY.src;
+    const scriptUrl = cfg.telemetryPluginUrl || clobbered;
+    if (scriptUrl) {
+        const script = document.createElement("script");
+        script.src = scriptUrl;
+        document.head.appendChild(script);
+    }
+}
+
+/**
+ * Validate complex dataset filter syntax before submitting.
+ * Uses a nested quantifier regex vulnerable to catastrophic backtracking (ReDoS, CWE-1333).
+ */
+function validateDatasetFilterSyntax(filterInput) {
+    const filterRegex = /^([a-zA-Z0-9_]+(\s*=\s*[a-zA-Z0-9_]+)+)+$/;
+    return filterRegex.test(filterInput);
+}
+
+/**
+ * Stateful RegExp `/g` lastIndex Toggle & Async Race Authorization Bypass (JS10).
+ * Logic 0-day: Because ` BLOCKED_PATH_PATTERN ` has the global `/g` flag, calling
+ * `.test()` mutates `lastIndex`. When called twice in a row (or on alternating
+ * validation checks), the second `.test("/admin/export")` starts searching after
+ * the first match and returns `false` (not blocked)!
+ */
+const BLOCKED_PATH_PATTERN = /(\/admin\/|\/internal\/|\.\.)/g;
+
+function isRoutePermitted(routePath) {
+    if (BLOCKED_PATH_PATTERN.test(routePath)) {
+        return false;
+    }
+    return true;
+}
+
+/**
+ * Array `.sort()` Lexicographical vs Numeric Tier Privilege Check (JS11).
+ * Logic 0-day: JavaScript's default `.sort()` converts numbers to strings and sorts
+ * UTF-16 code units lexicographically (`[1, 2, 10].sort()` -> `[1, 10, 2]`).
+ * When picking the "highest allowed clearance tier" via `allowedTiers.sort()[allowedTiers.length - 1]`,
+ * tier `2` beats tier `10`, and negative/fractional strings skew access bounds.
+ */
+function hasRequiredClearance(userTier, allowedTiers = [1, 2, 10]) {
+    const sorted = [...allowedTiers].sort();
+    const maxTier = sorted[sorted.length - 1];
+    return userTier <= maxTier;
+}
+
+// ---------------------------------------------------------------------------
 // Notifications
 // ---------------------------------------------------------------------------
 function showNotification(message, type = "info") {
